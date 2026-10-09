@@ -446,6 +446,10 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
             None,
         )
 
+    def narrow_n_maximum(self) -> int | None:
+        tile_n = self.mma_tiler_mn[1]
+        return tile_n if tile_n < 64 else None
+
     def _supports(
         self, args: GemmArguments, target_sm: TargetSm | None = None
     ) -> Status:
@@ -526,8 +530,8 @@ class VendoredDenseBlockScaledGemmKernel(CuteDslOperator):
         k = args.A.shape[-1]
         L = args.A.shape[0] if len(args.A.shape) == 3 else 1
 
-        if self.mma_tiler_mn[1] < 64 and (
-            n > self.mma_tiler_mn[1] or self.cluster_shape_mn[1] > 1
+        if (maximum := self.narrow_n_maximum()) is not None and (
+            n > maximum or self.cluster_shape_mn[1] > 1
         ):
             return Status.fail(
                 "Narrow-N tiles require a single N tile and cluster-N of one"
