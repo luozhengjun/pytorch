@@ -16,11 +16,58 @@ import logging
 import os
 import pickle
 import struct
+import threading
+from collections import OrderedDict
+from collections.abc import Iterator, MutableMapping
 from pathlib import Path
 from typing import Any
 
 
 log = logging.getLogger(__name__)
+
+
+class BoundedCache(MutableMapping[Any, Any]):
+    """Synchronize memory cache lookups, LRU updates, and artifact publication."""
+
+    def __init__(self, max_entries: int = 32) -> None:
+        if max_entries < 1:
+            raise ValueError("max_entries must be positive")
+        self._max_entries = max_entries
+        self._values: OrderedDict[Any, Any] = OrderedDict()
+        self._lock = threading.Lock()
+
+    def __getitem__(self, key: Any) -> Any:
+        with self._lock:
+            value = self._values[key]
+            self._values.move_to_end(key)
+            return value
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        with self._lock:
+            self._values[key] = value
+            self._values.move_to_end(key)
+            if len(self._values) > self._max_entries:
+                self._values.popitem(last=False)
+
+    def __delitem__(self, key: Any) -> None:
+        with self._lock:
+            del self._values[key]
+
+    def __iter__(self) -> Iterator[Any]:
+        with self._lock:
+            return iter(tuple(self._values))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._values)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            value = self._values.setdefault(key, default)
+            self._values.move_to_end(key)
+            if len(self._values) > self._max_entries:
+                self._values.popitem(last=False)
+            return value
 
 
 def _fix_elf_dup_text_flags(data: bytes) -> bytes:
@@ -86,7 +133,7 @@ def _make_disk_key(
 
 
 def disk_cache_get(
-    mem_cache: dict[Any, Any],
+    mem_cache: MutableMapping[Any, Any],
     module_path: str,
     config_key: tuple[Any, ...],
     runtime_key: tuple[Any, ...],
@@ -95,8 +142,9 @@ def disk_cache_get(
 ) -> Any | None:
     """Look up a compiled CuTe DSL function, checking memory then disk."""
     mem_key = (runtime_key, device_index)
-    if mem_key in mem_cache:
-        return mem_cache[mem_key]
+    value = mem_cache.get(mem_key)
+    if value is not None:
+        return value
 
     h = _make_disk_key(
         module_path, config_key, runtime_key, device_index, device_capability
@@ -121,7 +169,7 @@ def disk_cache_get(
 
 
 def disk_cache_set(
-    mem_cache: dict[Any, Any],
+    mem_cache: MutableMapping[Any, Any],
     module_path: str,
     config_key: tuple[Any, ...],
     runtime_key: tuple[Any, ...],

@@ -995,6 +995,8 @@ class AsyncCompile:
         has_output_scale=False,
         swap_ab=False,
         metadata=None,
+        *,
+        symbolic_shapes: bool = False,
     ):
         """Submit NVGEMM kernel precompilation to the subprocess pool.
 
@@ -1026,6 +1028,7 @@ class AsyncCompile:
             has_output_scale,
             swap_ab,
             metadata,
+            symbolic_shapes,
         )
 
     def metal(self, kernel_name: str, source: str, headers: list[str]) -> None:

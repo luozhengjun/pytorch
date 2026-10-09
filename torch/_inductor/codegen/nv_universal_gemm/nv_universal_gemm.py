@@ -11,6 +11,8 @@ import re
 from enum import auto, Enum
 from typing import Any, Literal
 
+import sympy
+
 import torch
 from torch._inductor import config
 from torch._inductor.autotune_process import (
@@ -56,6 +58,10 @@ from torch._inductor.kernel_inputs import MMKernelInputs
 from torch._inductor.utils import ensure_nv_universal_gemm_available
 from torch._inductor.virtualized import V
 from torch._logging import getArtifactLogger
+from torch.fx.experimental.symbolic_shapes import (
+    free_unbacked_symbols,
+    has_free_symbols,
+)
 
 
 log = getArtifactLogger(__name__, "output_code")
@@ -113,6 +119,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         swap_ab: bool = False,
         has_bias_epilogue: bool = False,
         has_output_scale: bool = False,
+        symbolic_shapes: bool = False,
     ) -> None:
         super().__init__(kernel_name, input_tensor_meta, output_tensor_meta, ())
         self.kernel = kernel
@@ -128,6 +135,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
         self.swizzle_type_a = swizzle_type_a
         self.swizzle_type_b = swizzle_type_b
         self.swap_ab = swap_ab
+        self.symbolic_shapes = symbolic_shapes
         input_dtype_b = (
             self.input_tensor_meta[1].dtype if len(self.input_tensor_meta) > 1 else None
         )
@@ -244,7 +252,12 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
                 }
             )
 
-        cache_key = _create_gemm_cache_key(input_tensors, out, logical_m=logical_m)
+        cache_key = _create_gemm_cache_key(
+            input_tensors,
+            out,
+            logical_m=logical_m,
+            symbolic_shapes=self.symbolic_shapes,
+        )
         dev_idx = input_tensors[0].device.index or 0
         kernel_name = self.kernel.metadata.operator_name
         disk_config_key = _make_disk_config_key(
@@ -283,6 +296,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             output_scale=output_scale,
             fallback_fn=disk_fallback,
             cc=_current_target_sm(dev_idx).cc,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
         if was_compiled:
@@ -343,7 +357,9 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             has_epilogue=True,
             aux_tensors=(bias,),
             epilogue_source=_NVGEMM_BIAS_ADD_EPILOGUE_FINGERPRINT,
+            epilogue_args=epilogue_args,
             logical_m=out.shape[-2],
+            symbolic_shapes=self.symbolic_shapes,
         )
         dev_idx = gemm_tensors[0].device.index or 0
         disk_config_key = _make_disk_config_key(
@@ -383,6 +399,7 @@ class NVUniversalGemmBenchmarkRequest(GPUDeviceBenchmarkMixin, BenchmarkRequest)
             fallback_fn=disk_fallback,
             base_kernel=self.kernel,
             cc=_current_target_sm(dev_idx).cc,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
         if was_compiled:
@@ -474,6 +491,10 @@ class NVUniversalGemmCaller(ChoiceCaller):
         self.output_scale_node = output_scale_node
         self._kernel_layout = kernel_layout or layout
         self._cached_output_node: TensorBox | None = None
+        operand_layouts = [(node.get_size(), node.get_stride()) for node in input_nodes]
+        self.symbolic_shapes = variant == GemmVariant.GEMM and has_free_symbols(
+            (operand_layouts, layout.size, layout.stride)
+        )
 
         output_buffer = Buffer(name=f"{variant.op_name}_out", layout=layout)
 
@@ -492,6 +513,7 @@ class NVUniversalGemmCaller(ChoiceCaller):
             swap_ab=swap_ab,
             has_bias_epilogue=bias_node is not None,
             has_output_scale=output_scale_node is not None,
+            symbolic_shapes=self.symbolic_shapes,
         )
 
     def __str__(self) -> str:
@@ -504,8 +526,211 @@ class NVUniversalGemmCaller(ChoiceCaller):
         self.bmreq.benchmark_with_cudagraphs = self._benchmark_with_cudagraphs
         return self.bmreq.benchmark(*args, out=out)
 
-    def output_node(self) -> TensorBox:
+    @staticmethod
+    def _constraint_major_dim(size, stride, constraint) -> int:
+        expected_stride = constraint.stride
+        if expected_stride is None:
+            hinted_size = V.graph.sizevars.optimization_hints(size)
+            hinted_stride = V.graph.sizevars.optimization_hints(stride)
+            major_dim = next(
+                (
+                    dim
+                    for dim, (extent, step) in enumerate(
+                        zip(hinted_size, hinted_stride, strict=True)
+                    )
+                    if extent > 1 and step == 1
+                ),
+                len(size) - 1 if all(extent == 1 for extent in hinted_size) else None,
+            )
+            if major_dim is None:
+                raise AssertionError("selected NVGEMM operand has no contiguous mode")
+        else:
+            if len(expected_stride) == len(stride):
+                normalized_stride = expected_stride
+            elif len(expected_stride) - 1 == len(stride):
+                normalized_stride = expected_stride[1:]
+            else:
+                raise AssertionError(
+                    "selected NVGEMM operand constraint has incompatible rank"
+                )
+            major_dim = normalized_stride.index(1)
+        return major_dim
+
+    @classmethod
+    def _tensor_constraint_checks(cls, size, stride, offset, itemsize, constraint):
+        major_dim = cls._constraint_major_dim(size, stride, constraint)
+        yield (
+            sympy.Eq(stride[major_dim], 1),
+            "selected NVGEMM operand is not contiguous",
+        )
+        if constraint.divisibility > 1:
+            yield (
+                sympy.Eq(sympy.Mod(size[major_dim], constraint.divisibility), 0),
+                "selected NVGEMM operand extent violates alignment",
+            )
+            for dim, step in enumerate(stride):
+                if dim != major_dim:
+                    yield (
+                        sympy.Eq(sympy.Mod(step, constraint.divisibility), 0),
+                        "selected NVGEMM operand stride violates alignment",
+                    )
+        if constraint.ptr_alignment_bytes > 1:
+            offset_bytes = offset * itemsize
+            yield (
+                sympy.Eq(sympy.Mod(offset_bytes, constraint.ptr_alignment_bytes), 0),
+                "selected NVGEMM operand pointer is misaligned",
+            )
+
+    @classmethod
+    def _tensor_constraint_satisfied(
+        cls, size, stride, offset, itemsize, constraint
+    ) -> bool:
+        if free_unbacked_symbols((size, stride, offset)):
+            return False
+        if V.graph.sizevars.shape_env.frozen:
+            return all(
+                V.graph.sizevars.statically_known_true(condition)
+                for condition, _ in cls._tensor_constraint_checks(
+                    size, stride, offset, itemsize, constraint
+                )
+            )
+        major_dim = cls._constraint_major_dim(size, stride, constraint)
+        hinted_size = V.graph.sizevars.optimization_hints(size)
+        hinted_stride = V.graph.sizevars.optimization_hints(stride)
+        hinted_offset = V.graph.sizevars.optimization_hint(offset)
+
+        if hinted_stride[major_dim] != 1:
+            return False
+        if constraint.divisibility > 1:
+            if hinted_size[major_dim] % constraint.divisibility != 0:
+                return False
+            if any(
+                step % constraint.divisibility != 0
+                for dim, step in enumerate(hinted_stride)
+                if dim != major_dim
+            ):
+                return False
+        return constraint.ptr_alignment_bytes <= 1 or (
+            hinted_offset * itemsize % constraint.ptr_alignment_bytes == 0
+        )
+
+    @classmethod
+    def _guard_tensor_constraint(
+        cls, size, stride, offset, itemsize, constraint
+    ) -> None:
+        for condition, message in cls._tensor_constraint_checks(
+            size, stride, offset, itemsize, constraint
+        ):
+            if not cls._guard_or_prove_shape_constraint(condition):
+                raise AssertionError(message)
+
+    @staticmethod
+    def _guard_or_prove_shape_constraint(condition) -> bool:
+        sizevars = V.graph.sizevars
+        # Lazy backward compilation cannot add guards to the forward graph.
+        if sizevars.shape_env.frozen:
+            return sizevars.statically_known_true(condition)
+        return sizevars.guard_or_false(condition)
+
+    @staticmethod
+    def _tensor_geometry(node, transpose: bool = False):
+        size = list(node.get_size())
+        stride = list(node.get_stride())
+        if transpose:
+            size[-2:] = reversed(size[-2:])
+            stride[-2:] = reversed(stride[-2:])
+        return size, stride
+
+    def _guard_dynamic_shape_constraints(self) -> None:
+        if self.variant != GemmVariant.GEMM:
+            return
+
+        operands = self.kernel.metadata.operands
+        a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
+        for node, constraint in (
+            (self.input_nodes[a_idx], operands.A),
+            (self.input_nodes[b_idx], operands.B),
+        ):
+            size, stride = self._tensor_geometry(node, self.swap_ab)
+            self._guard_tensor_constraint(
+                size,
+                stride,
+                node.get_layout().offset,
+                node.get_dtype().itemsize,
+                constraint,
+            )
+        self._guard_tensor_constraint(
+            self._kernel_layout.size,
+            self._kernel_layout.stride,
+            self._kernel_layout.offset,
+            self._kernel_layout.dtype.itemsize,
+            operands.out,
+        )
+        if minimums := self._preferred_cluster_minimums():
+            for extent, minimum in zip(
+                self._kernel_layout.size[-2:], minimums, strict=True
+            ):
+                if not self._guard_or_prove_shape_constraint(sympy.Ge(extent, minimum)):
+                    raise AssertionError(
+                        "selected NVGEMM preferred cluster exceeds problem shape"
+                    )
+
+    def _preferred_cluster_minimums(self) -> tuple[int, int] | None:
+        design = self.kernel.metadata.design
+        if getattr(design, "fallback_cluster_shape", None) is None:
+            return None
+        return (
+            design.tile_shape[0] * design.cluster_shape[0],
+            design.tile_shape[1] * design.cluster_shape[1],
+        )
+
+    def _supports_current_shape_constraints(self) -> bool:
+        if self.variant != GemmVariant.GEMM:
+            return True
+
+        operands = self.kernel.metadata.operands
+        a_idx, b_idx = (1, 0) if self.swap_ab else (0, 1)
+        for node, constraint in (
+            (self.input_nodes[a_idx], operands.A),
+            (self.input_nodes[b_idx], operands.B),
+        ):
+            size, stride = self._tensor_geometry(node, self.swap_ab)
+            if not self._tensor_constraint_satisfied(
+                size,
+                stride,
+                node.get_layout().offset,
+                node.get_dtype().itemsize,
+                constraint,
+            ):
+                return False
+        if not self._tensor_constraint_satisfied(
+            self._kernel_layout.size,
+            self._kernel_layout.stride,
+            self._kernel_layout.offset,
+            self._kernel_layout.dtype.itemsize,
+            operands.out,
+        ):
+            return False
+        if minimums := self._preferred_cluster_minimums():
+            if V.graph.sizevars.shape_env.frozen:
+                return all(
+                    V.graph.sizevars.statically_known_true(sympy.Ge(extent, minimum))
+                    for extent, minimum in zip(
+                        self._kernel_layout.size[-2:], minimums, strict=True
+                    )
+                )
+            shape = V.graph.sizevars.optimization_hints(self._kernel_layout.size[-2:])
+            return all(
+                extent >= minimum
+                for extent, minimum in zip(shape, minimums, strict=True)
+            )
+        return True
+
+    def output_node(self, *, install_guards: bool = True) -> TensorBox:
         from torch._inductor.ir import NVUniversalGemmBuffer
+
+        if install_guards:
+            self._guard_dynamic_shape_constraints()
 
         # Without memoization, each call registers a new buffer (via
         # TemplateBuffer.__init__ → V.graph.register_buffer), leaking orphan
@@ -1036,6 +1261,8 @@ def _add_nv_gemm_choices_impl(
                 bias_node=bias_node,
                 output_scale_node=output_scale_node,
             )
+            if not caller._supports_current_shape_constraints():
+                continue
             choices.append(caller)
             num_added += 1
         except Exception:

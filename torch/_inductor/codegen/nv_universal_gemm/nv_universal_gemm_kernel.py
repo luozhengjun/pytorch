@@ -14,6 +14,7 @@ import functools
 import hashlib
 import importlib
 import logging
+import math
 import re
 import threading
 from collections import OrderedDict
@@ -76,6 +77,7 @@ def _local_reduce_source_constant(field: str) -> str:
 
 def _normalize_epilogue_input_tensor(value: Any, permute=None) -> Any:
     import torch
+    from torch._subclasses.fake_tensor import is_fake_tensor
 
     if not isinstance(value, torch.Tensor):
         return value
@@ -88,7 +90,61 @@ def _normalize_epilogue_input_tensor(value: Any, permute=None) -> Any:
         value = value.expand(8, 1).contiguous()
     elif not value.is_contiguous():
         value = value.contiguous()
+    elif not is_fake_tensor(value) and value.data_ptr() % 16:
+        value = value.clone()
     return value
+
+
+def _epilogue_layout_contract(shape, stride, width, alignment):
+    from cutlass.operators.utils.tensor import major_mode
+
+    major = major_mode(shape, stride)
+    if major is None:
+        raise ValueError(
+            f"Epilogue tensor has no contiguous mode: shape={shape}, stride={stride}"
+        )
+    max_divisibility = max(alignment * 8 // width, 1)
+    divisibility = tuple(
+        1 if dim == major or shape[dim] == 1 else math.gcd(step, max_divisibility)
+        for dim, step in enumerate(stride)
+    )
+    return major, divisibility
+
+
+def _epilogue_tensor_alignment(tensor):
+    from torch._subclasses.fake_tensor import is_fake_tensor
+
+    address = (
+        tensor.storage_offset() * tensor.element_size()
+        if is_fake_tensor(tensor)
+        else tensor.data_ptr()
+    )
+    return math.gcd(address, 16)
+
+
+def _mark_epilogue_tensor_dynamic(wrapper, alignment_bytes: int | None = None):
+    import cutlass.cute as cute
+
+    if alignment_bytes is None:
+        alignment_bytes = math.gcd(wrapper._data_ptr, 16)
+    if wrapper.dtype.width < 8:
+        return wrapper
+    major, divisibility = _epilogue_layout_contract(
+        wrapper.shape, wrapper.stride, wrapper.dtype.width, alignment_bytes
+    )
+
+    shape = tuple(1 if extent == 1 else cute.sym_int64() for extent in wrapper.shape)
+    stride = tuple(
+        1 if dim == major else cute.sym_int64(divisibility=divisibility[dim])
+        for dim in range(len(wrapper.shape))
+    )
+    wrapper.compile_time_tensor = cute.runtime.make_fake_tensor(
+        wrapper.dtype,
+        shape,
+        stride,
+        assumed_align=alignment_bytes,
+    )
+    return wrapper
 
 
 def _transpose_local_reduce_tensors(
@@ -109,6 +165,42 @@ def _cutedsl_epilogue_io(
     if GEMM_ACCUMULATOR_ARG_NAME not in inputs:
         inputs = [GEMM_ACCUMULATOR_ARG_NAME, *inputs]
     return tuple(inputs), tuple(outputs)
+
+
+def _epilogue_readonly_input_names(epilogue) -> tuple[str, ...]:
+    source = epilogue.epilogue_fn
+    if isinstance(source, CuTeDSLEpilogueSource):
+        inputs, outputs = source.schema.inputs, source.schema.outputs
+    else:
+        inputs, outputs = _cutedsl_epilogue_io(source)
+    return tuple(name for name in inputs if name not in outputs)
+
+
+def _normalize_epilogue_inputs(epilogue, *, scalar_inputs: bool | None = None) -> None:
+    import torch
+
+    for name in _epilogue_readonly_input_names(epilogue):
+        value = epilogue.tensors.get(name)
+        if isinstance(value, torch.Tensor) and (
+            scalar_inputs is None or (value.ndim == 0) == scalar_inputs
+        ):
+            epilogue.tensors[name] = _normalize_epilogue_input_tensor(value)
+
+
+def _mark_epilogue_tensors_dynamic(
+    epilogue, alignments: dict[str, int] | None = None
+) -> None:
+    from cutlass.operators.utils.tensor import TensorWrapper
+
+    static_names = (
+        epilogue._scalar_reduction_destinations()
+        if hasattr(epilogue, "_scalar_reduction_destinations")
+        else ()
+    )
+    for name, value in epilogue.tensors.items():
+        if isinstance(value, TensorWrapper) and name not in static_names:
+            alignment = alignments.get(name) if alignments is not None else None
+            _mark_epilogue_tensor_dynamic(value, alignment)
 
 
 class CuTeDSLEpilogueArguments:
@@ -177,14 +269,14 @@ class CuTeDSLEpilogueArguments:
 
         import torch
 
-        input_names = self.epilogue_fn.schema.inputs
+        input_names = _epilogue_readonly_input_names(self)
         for name, value in self.tensors.items():
             if name in input_names:
                 value = _normalize_epilogue_input_tensor(value, permute)
             elif isinstance(value, torch.Tensor) and permute is not None:
                 value = value.permute(permute)
             if isinstance(value, torch.Tensor):
-                self.tensors[name] = TensorWrapper(value)
+                self.tensors[name] = TensorWrapper(value, alignment_bytes=16)
 
 
 @functools.cache
@@ -246,6 +338,7 @@ def _compile_nvgemm(
     prefetch_mode: str | None = None,
     use_pdl: bool | None = None,
     kernel_output_dtype: torch.dtype | str | None = None,
+    symbolic_shapes: bool = False,
 ):
     """Compile an NVGEMM artifact, trying a fallback (disk cache) first.
 
@@ -272,6 +365,7 @@ def _compile_nvgemm(
         accumulator_type,
         output_scale=output_scale,
         epilogue=epilogue_args,
+        symbolic_shapes=symbolic_shapes,
         **(args_kwargs or {}),
     )
     if kernel_obj is not None:
@@ -287,7 +381,9 @@ def _compile_nvgemm(
             prefetch_mode=prefetch_mode,
             use_pdl=use_pdl,
             kernel_output_dtype=kernel_output_dtype,
-            epilogue_specialization=_local_reduce_specialization(args_kwargs),
+            epilogue_specialization=_local_reduce_specialization(
+                args_kwargs, symbolic_shapes=symbolic_shapes
+            ),
         )
 
     artifact = None
@@ -387,6 +483,7 @@ def _worker_nvgemm_autotuning_precompile(
     has_output_scale=False,
     swap_ab=False,
     metadata=None,
+    symbolic_shapes: bool = False,
 ):
     """Subprocess worker: compile one NVGEMM kernel and save to disk cache.
 
@@ -482,7 +579,9 @@ def _worker_nvgemm_autotuning_precompile(
         has_epilogue=has_bias_epilogue,
         aux_tensors=aux_tensors,
         epilogue_source=epilogue_source,
+        epilogue_args=epilogue_args,
         logical_m=logical_m,
+        symbolic_shapes=symbolic_shapes,
     )
     dev_idx = input_tensors[0].device.index or 0
     disk_config_key = _make_disk_config_key(
@@ -540,6 +639,7 @@ def _worker_nvgemm_autotuning_precompile(
             base_kernel=base_kernel,
             prefetch_mode=prefetch_mode,
             use_pdl=use_pdl,
+            symbolic_shapes=symbolic_shapes,
         )
 
         if was_compiled:
@@ -593,8 +693,20 @@ def _create_gemm_arguments(
     epilogue: Any | None = None,
     local_reduce: GemmReductionArguments | None = None,
     logical_m: Any | None = None,
+    symbolic_shapes: bool = False,
 ):
     import cutlass.operators
+
+    import torch
+
+    epilogue_alignments = {}
+    if epilogue is not None and symbolic_shapes:
+        input_names = _epilogue_readonly_input_names(epilogue)
+        epilogue_alignments = {
+            name: 16 if name in input_names else _epilogue_tensor_alignment(value)
+            for name, value in epilogue.tensors.items()
+            if isinstance(value, torch.Tensor)
+        }
 
     local_reduce = local_reduce or GemmReductionArguments()
     has_local_reduce = local_reduce.enabled
@@ -627,6 +739,9 @@ def _create_gemm_arguments(
         raise NotImplementedError(
             "Epilogue fusion is not yet supported for grouped GEMM"
         )
+    direct_epilogue = epilogue is not None and isinstance(
+        epilogue.epilogue_fn, CuTeDSLEpilogueSource
+    )
 
     match variant_name:
         case "GROUPED_GEMM":
@@ -646,9 +761,9 @@ def _create_gemm_arguments(
             scaled_a = ScaledOperand(a, scale_a, scale_mode_a, swizzle_mode_a)
             scaled_b = ScaledOperand(b, scale_b, scale_mode_b, swizzle_mode_b)
             kwargs: dict[str, Any] = {"accumulator_type": accumulator_type}
-            if epilogue is not None:
+            if direct_epilogue:
                 kwargs["epilogue"] = epilogue
-            return with_local_reduce(
+            args = with_local_reduce(
                 cutlass.operators.arguments.GemmArguments(
                     scaled_a,
                     scaled_b,
@@ -660,14 +775,32 @@ def _create_gemm_arguments(
         case "GEMM":
             a, b = input_tensors
             kwargs: dict[str, Any] = {"accumulator_type": accumulator_type}
-            if epilogue is not None:
+            if direct_epilogue:
                 kwargs["epilogue"] = epilogue
-            return with_local_reduce(
+            args = with_local_reduce(
                 cutlass.operators.arguments.GemmArguments(a, b, out, **kwargs)
             )
 
         case _:
             raise NotImplementedError(f"Unsupported NVGEMM variant: {variant_name}")
+
+    if epilogue is not None and not direct_epilogue:
+        problem = args.problem_size
+        scalar_inputs = {
+            name: value
+            for name in _epilogue_readonly_input_names(epilogue)
+            if isinstance(value := epilogue.tensors.get(name), torch.Tensor)
+            and value.ndim == 0
+        }
+        _normalize_epilogue_inputs(epilogue, scalar_inputs=False)
+        epilogue.trace((problem.L, problem.M, problem.N), args.accumulator_type)
+        for name, scalar in scalar_inputs.items():
+            epilogue.tensors[name] = _normalize_epilogue_input_tensor(scalar)
+        epilogue.to_tensor_wrappers()
+        args.epilogue = epilogue
+    if epilogue is not None and symbolic_shapes:
+        _mark_epilogue_tensors_dynamic(args.epilogue, epilogue_alignments)
+    return args
 
 
 def _lookup_gemm_kernel(
@@ -743,14 +876,69 @@ def _tensor_sig(t):
     return (t.shape, t.stride(), t.dtype)
 
 
-def _local_reduce_specialization(variant_kwargs: dict | None) -> tuple:
+def _symbolic_tensor_sig(t):
+    stride = t.stride()
+    stride_rank = tuple(sorted(range(len(stride)), key=lambda dim: (stride[dim], dim)))
+    return (t.dtype, t.ndim, stride_rank)
+
+
+def _symbolic_epilogue_sig(epilogue_args):
+    from cutlass.operators.utils import dtype as dtype_utils
+
+    import torch
+    from torch._prims_common import make_contiguous_strides_for
+
+    if epilogue_args is None:
+        return ()
+    input_names = OrderedSet(_epilogue_readonly_input_names(epilogue_args))
+    signature: list[tuple[Any, ...]] = []
+    for name, value in epilogue_args.tensors.items():
+        if not isinstance(value, torch.Tensor):
+            signature.append((name, type(value)))
+            continue
+        shape = tuple(value.shape)
+        stride = value.stride()
+        alignment = _epilogue_tensor_alignment(value)
+        if name in input_names:
+            if not shape:
+                shape = (8, 1)
+            stride = make_contiguous_strides_for(shape)
+            alignment = 16
+        if dtype_utils.cutlass_type_from_torch_type(value.dtype).width < 8:
+            signature.append((name, shape, tuple(stride), value.dtype))
+            continue
+        major, divisibility = _epilogue_layout_contract(
+            shape,
+            stride,
+            dtype_utils.cutlass_type_from_torch_type(value.dtype).width,
+            alignment,
+        )
+        signature.append(
+            (
+                name,
+                value.dtype,
+                tuple(extent == 1 for extent in shape),
+                major,
+                alignment,
+                divisibility,
+            )
+        )
+    return tuple(signature)
+
+
+def _local_reduce_specialization(
+    variant_kwargs: dict | None, *, symbolic_shapes: bool = False
+) -> tuple:
     if variant_kwargs is None or not (reduction := variant_kwargs.get("local_reduce")):
         return ()
     specialization = tuple(reduction.specialization_items())
+    # Reduction destinations and feed tensors may have static compile metadata.
+    # Keep their exact extents even when the main GEMM artifact is symbolic.
+    tensor_sig = _tensor_sig
     tensor_specialization = tuple(
         (
             field,
-            None if tensor is None else _tensor_sig(tensor),
+            None if tensor is None else tensor_sig(tensor),
         )
         for field, tensor in reduction.tensor_items()
     )
@@ -765,15 +953,26 @@ def _create_gemm_cache_key(
     aux_tensors: tuple = (),
     epilogue_source: str = "",
     epilogue_specialization: tuple = (),
+    epilogue_args=None,
     logical_m: Any | None = None,
+    symbolic_shapes: bool = False,
 ):
-    cache_key = tuple(s for t in input_tensors for s in _tensor_sig(t))
-    cache_key = (*cache_key, *_tensor_sig(out))
-    if logical_m is not None:
+    cache_key = (
+        tuple(_symbolic_tensor_sig(t) for t in (*input_tensors, out))
+        if symbolic_shapes
+        else tuple(s for t in input_tensors for s in _tensor_sig(t))
+    )
+    if not symbolic_shapes:
+        cache_key = (*cache_key, *_tensor_sig(out))
+    if logical_m is not None and not symbolic_shapes:
         cache_key = (*cache_key, "logical_m", logical_m)
 
     if has_epilogue:
-        aux_sig = tuple(_tensor_sig(t) for t in aux_tensors)
+        aux_sig = (
+            _symbolic_epilogue_sig(epilogue_args)
+            if symbolic_shapes
+            else tuple(_tensor_sig(t) for t in aux_tensors)
+        )
         return (
             *cache_key,
             "epilogue",
@@ -781,6 +980,8 @@ def _create_gemm_cache_key(
             aux_sig,
             epilogue_specialization,
         )
+    if epilogue_specialization:
+        return (*cache_key, "local_reduce", epilogue_specialization)
     return cache_key
 
 
@@ -864,61 +1065,58 @@ def _update_reuse_args_tensors(
     args_kwargs=None,
     output_scale=None,
 ) -> bool:
-    """Redirect the cached args at this call's runtime tensors.
+    """Reuse arguments only while their concrete layouts and trace remain valid.
 
-    A cache hit on ``mem_key`` guarantees identical shapes/strides/dtypes, so
-    only the data pointers change; mutating ``TensorWrapper._runtime_tensor`` in
-    place is sufficient and lets us skip the (expensive) _create_gemm_arguments
-    rebuild. Returns False for GROUPED_GEMM (unsupported), signalling the caller
-    to use the rebuild path.
+    TVM-FFI launchers read runtime_tensor, while pointer launchers read data_ptr
+    and shape/stride. A shape change rebuilds arguments and the epilogue trace,
+    preserving the compiled artifact. Non-FFI tensors require DLPack conversion.
     """
+    from cutlass.operators.config import GlobalOptions
+    from cutlass.operators.utils.tensor import TensorWrapper
+
     if variant_name == "GROUPED_GEMM":
         return False
-
-    def redirect(wrapper, tensor) -> None:
-        # Some CuTeDSL operators launch through TVM-FFI and read
-        # ``runtime_tensor`` while others construct raw pointers from
-        # ``TensorWrapper.data_ptr``.  Keep both representations in sync when
-        # reusing a compiled argument object.  Updating only _runtime_tensor
-        # makes pointer-based kernels keep writing to the tensor from their
-        # first invocation; a subsequently captured CUDA graph then records a
-        # stale output address.
-        wrapper._runtime_tensor = tensor
-        wrapper._data_ptr = tensor.data_ptr()
+    if not GlobalOptions().use_tvm_ffi:
+        return False
 
     if variant_name == "SCALED_GEMM":
-        a, b, scale_a, scale_b = input_tensors
-        redirect(args.A.quantized.tensor, a)
-        redirect(args.A.scale.tensor, scale_a)
-        redirect(args.B.quantized.tensor, b)
-        redirect(args.B.scale.tensor, scale_b)
-        redirect(args.out.tensor, out)
+        wrappers = (
+            args.A.quantized.tensor,
+            args.B.quantized.tensor,
+            args.A.scale.tensor,
+            args.B.scale.tensor,
+            args.out.tensor,
+        )
     else:
-        # GEMM: dense mm and the EFC bias/epilogue addmm path.
-        a, b = input_tensors
-        redirect(args.A.tensor, a)
-        redirect(args.B.tensor, b)
-        redirect(args.out.tensor, out)
+        wrappers = (args.A.tensor, args.B.tensor, args.out.tensor)
+    runtime_tensors = list(zip(wrappers, (*input_tensors, out), strict=True))
     if output_scale is not None:
-        redirect(args.alpha, output_scale.reshape(1))
+        runtime_tensors.append((args.alpha, output_scale.reshape(1)))
     epilogue = getattr(args, "epilogue", None)
     if epilogue is not None:
-        source = epilogue.epilogue_fn
-        input_names = (
-            source.schema.inputs if isinstance(source, CuTeDSLEpilogueSource) else ()
-        )
+        input_names = _epilogue_readonly_input_names(epilogue)
         for name, wrapper in epilogue.tensors.items():
+            if not isinstance(wrapper, TensorWrapper):
+                continue
             val = epilogue_args.tensors[name]
             runtime_tensor = getattr(val, "runtime_tensor", val)
             if name in input_names:
                 runtime_tensor = _normalize_epilogue_input_tensor(runtime_tensor)
-            redirect(wrapper, runtime_tensor)
+            runtime_tensors.append((wrapper, runtime_tensor))
     runtime_reduce = args_kwargs.get("local_reduce") if args_kwargs else None
     for field, output in args.local_reduce.tensor_items():
         if output is not None:
             if runtime_reduce is None:
                 raise AssertionError("expected runtime local-reduction arguments")
-            redirect(output, getattr(runtime_reduce, field))
+            runtime_tensors.append((output, getattr(runtime_reduce, field)))
+    if variant_name == "GEMM":
+        for wrapper, tensor in runtime_tensors:
+            shape, stride = tuple(tensor.shape), tensor.stride()
+            if wrapper.shape != shape or wrapper.stride != stride:
+                return False
+    for wrapper, tensor in runtime_tensors:
+        wrapper._runtime_tensor = tensor
+        wrapper._data_ptr = tensor.data_ptr()
     return True
 
 
@@ -930,6 +1128,7 @@ def _clear_reuse_args_tensors(variant_name, args, epilogue_args):
     references is safe. Required for cudagraph capture, which fails if a cached
     object retains a tensor from the graph pool between iterations.
     """
+    from cutlass.operators.utils.tensor import TensorWrapper
 
     def clear(wrapper) -> None:
         wrapper._runtime_tensor = None
@@ -950,7 +1149,8 @@ def _clear_reuse_args_tensors(variant_name, args, epilogue_args):
     epilogue = getattr(args, "epilogue", None)
     if epilogue is not None:
         for wrapper in epilogue.tensors.values():
-            clear(wrapper)
+            if isinstance(wrapper, TensorWrapper):
+                clear(wrapper)
         # kernel.run traces the epilogue on first launch, and the trace retains
         # the real output/aux tensors in example_inputs (used only for tracing,
         # not the launch). Replace them with meta tensors so the cached args
@@ -994,6 +1194,7 @@ def _nvgemm_run(
     prefetch_mode: str | None = None,
     use_pdl: bool | None = None,
     kernel_output_dtype: torch.dtype | str | None = None,
+    symbolic_shapes: bool = False,
 ):
     variant_kwargs = dict(variant_kwargs or {})
     variant_kwargs["logical_m"] = out.shape[-2]
@@ -1040,7 +1241,9 @@ def _nvgemm_run(
 
     from torch._inductor.runtime.cutedsl_cache import disk_cache_get, disk_cache_set
 
-    epilogue_specialization = _local_reduce_specialization(variant_kwargs)
+    epilogue_specialization = _local_reduce_specialization(
+        variant_kwargs, symbolic_shapes=symbolic_shapes
+    )
     cache_key = _create_gemm_cache_key(
         input_tensors,
         out,
@@ -1048,58 +1251,16 @@ def _nvgemm_run(
         aux_tensors=aux_tensors,
         epilogue_source=epilogue_source,
         epilogue_specialization=epilogue_specialization,
+        epilogue_args=epilogue_args,
         logical_m=variant_kwargs["logical_m"],
+        symbolic_shapes=symbolic_shapes,
     )
     dev_idx = input_tensors[0].device.index or 0
     mem_key = (cache_key, dev_idx)
 
-    if mem_key in compiled_cache:
-        artifact = compiled_cache[mem_key]
-        # Fast path: reuse the previously-built args, redirecting only the
-        # runtime tensor pointers. Skips _create_gemm_arguments, whose cost
-        # (get_type_hints + deepcopy + full epilogue/layout reprocessing)
-        # depends solely on shapes/layout -- fixed for a given mem_key.
-        reuse = getattr(artifact, "_nvgemm_reuse", None)
-        if reuse is not None:
-            args, kernel, reuse_lock = reuse
-            # The cached args are shared mutable state. Serialize the
-            # redirect->launch->clear so concurrent launches on the same cached
-            # artifact (e.g. two graph executions sharing this kernel) don't
-            # stomp each other's runtime tensor pointers.
-            with reuse_lock:
-                if _update_reuse_args_tensors(
-                    variant_name,
-                    args,
-                    input_tensors,
-                    out,
-                    epilogue_args,
-                    variant_kwargs,
-                    output_scale,
-                ):
-                    try:
-                        kernel.run(
-                            args,
-                            artifact,
-                            stream=stream,
-                            workspace=workspace,
-                            assume_supported_args=True,
-                        )
-                    finally:
-                        _clear_reuse_args_tensors(variant_name, args, epilogue_args)
-                    return
-        # No reusable args (e.g. artifact loaded from disk by a subprocess
-        # precompile): build them once, then attach below for future calls.
-        args = _create_gemm_arguments(
-            variant_name,
-            input_tensors,
-            out,
-            accumulator_type,
-            output_scale=output_scale,
-            epilogue=epilogue_args,
-            **(variant_kwargs or {}),
-        )
-        kernel = artifact.operator_obj
-    else:
+    artifact: Any = compiled_cache.get(mem_key)
+    args = None
+    if artifact is None:
 
         def disk_fallback(kernel):
             compiled_fn = disk_cache_get(
@@ -1136,6 +1297,7 @@ def _nvgemm_run(
             prefetch_mode=prefetch_mode,
             use_pdl=use_pdl,
             kernel_output_dtype=kernel_output_dtype,
+            symbolic_shapes=symbolic_shapes,
         )
 
         if was_compiled:
@@ -1148,37 +1310,20 @@ def _nvgemm_run(
                 dev_idx,
             )
 
-        compiled_cache[mem_key] = artifact
-
-    # Attach the built args for reuse on subsequent calls (skipped for
-    # GROUPED_GEMM, where _update_reuse_args_tensors returns False). This runs
-    # for both the disk-loaded rebuild branch and the fresh-compile branch.
-    reuse_supported = _update_reuse_args_tensors(
-        variant_name,
-        args,
-        input_tensors,
-        out,
-        epilogue_args,
-        variant_kwargs,
-        output_scale,
-    )
-    if reuse_supported:
-        # Publish and launch under the lock so a concurrent reuse-path caller
-        # that picks up these args blocks until this launch has cleared them.
-        reuse_lock = threading.Lock()
-        with reuse_lock:
-            artifact._nvgemm_reuse = (args, kernel, reuse_lock)
-            try:
-                kernel.run(
-                    args,
-                    artifact,
-                    stream=stream,
-                    workspace=workspace,
-                    assume_supported_args=True,
-                )
-            finally:
-                _clear_reuse_args_tensors(variant_name, args, epilogue_args)
-    else:
+        artifact = compiled_cache.setdefault(mem_key, artifact)
+    kernel = artifact.operator_obj
+    if variant_name == "GROUPED_GEMM":
+        if args is None:
+            args = _create_gemm_arguments(
+                variant_name,
+                input_tensors,
+                out,
+                accumulator_type,
+                output_scale=output_scale,
+                epilogue=epilogue_args,
+                symbolic_shapes=symbolic_shapes,
+                **variant_kwargs,
+            )
         kernel.run(
             args,
             artifact,
@@ -1186,6 +1331,49 @@ def _nvgemm_run(
             workspace=workspace,
             assume_supported_args=True,
         )
+        return
+
+    # Only initialization takes the compile lock. Each artifact owns a launch
+    # lock, protecting argument rebuild/redirect/launch/clear as one operation.
+    if getattr(artifact, "_nvgemm_reuse", None) is None:
+        with CUTEDSL_COMPILE_LOCK:
+            if getattr(artifact, "_nvgemm_reuse", None) is None:
+                artifact._nvgemm_reuse = (None, kernel, threading.Lock())
+    _, kernel, reuse_lock = artifact._nvgemm_reuse
+    with reuse_lock:
+        cached_args, _, _ = artifact._nvgemm_reuse
+        if cached_args is not None and _update_reuse_args_tensors(
+            variant_name,
+            cached_args,
+            input_tensors,
+            out,
+            epilogue_args,
+            variant_kwargs,
+            output_scale,
+        ):
+            args = cached_args
+        elif args is None:
+            args = _create_gemm_arguments(
+                variant_name,
+                input_tensors,
+                out,
+                accumulator_type,
+                output_scale=output_scale,
+                epilogue=epilogue_args,
+                symbolic_shapes=symbolic_shapes,
+                **variant_kwargs,
+            )
+        artifact._nvgemm_reuse = (args, kernel, reuse_lock)
+        try:
+            kernel.run(
+                args,
+                artifact,
+                stream=stream,
+                workspace=workspace,
+                assume_supported_args=True,
+            )
+        finally:
+            _clear_reuse_args_tensors(variant_name, args, epilogue_args)
 
 
 # Patch both the canonical definition (integration_utils.mma) for callers that
@@ -1225,6 +1413,7 @@ def _nvgemm_precompile(
     prefetch_mode: str | None = None,
     use_pdl: bool | None = None,
     kernel_output_dtype: torch.dtype | str | None = None,
+    symbolic_shapes: bool = False,
 ):
     """Precompile an NVGEMM kernel in a subprocess for parallel compilation.
 
@@ -1285,7 +1474,10 @@ def _nvgemm_precompile(
     patched = _patch_max_active_clusters(max_active_clusters)
     try:
         cache_key = _create_gemm_cache_key(
-            input_tensors, out, logical_m=variant_kwargs["logical_m"]
+            input_tensors,
+            out,
+            logical_m=variant_kwargs["logical_m"],
+            symbolic_shapes=symbolic_shapes,
         )
         mem_key = (cache_key, device_index)
         if mem_key not in compiled_cache:
@@ -1306,6 +1498,7 @@ def _nvgemm_precompile(
                 prefetch_mode=prefetch_mode,
                 use_pdl=use_pdl,
                 kernel_output_dtype=kernel_output_dtype,
+                symbolic_shapes=symbolic_shapes,
             )
             disk_cache_set(
                 disk_fn_cache,
@@ -1316,7 +1509,7 @@ def _nvgemm_precompile(
                 device_index,
                 device_capability=device_capability,
             )
-            compiled_cache[mem_key] = artifact
+            compiled_cache.setdefault(mem_key, artifact)
     finally:
         _restore_max_active_clusters(patched)
 
@@ -1486,6 +1679,14 @@ class NVUniversalGemmKernel(Kernel):
 
     def render(self) -> str:
         """Render the Python source for the NVGEMM kernel wrapper."""
+        from torch.fx.experimental.symbolic_shapes import has_free_symbols
+
+        symbolic_shapes = self.variant.name == "GEMM" and has_free_symbols(
+            [
+                (node.get_size(), node.get_stride())
+                for node in (*self.input_nodes, self.output_node)
+            ]
+        )
         kernel_name_str = self.kernel_metadata["kernel_name"]
         prefetch_mode = "1" if self.kernel_metadata.get("use_prefetch", False) else "0"
         use_pdl = bool(self.kernel_metadata.get("use_pdl", False))
@@ -1619,8 +1820,9 @@ class NVUniversalGemmKernel(Kernel):
         code.writeline(
             f"_DISK_CACHE_CONFIG_KEY = _make_disk_config_key({disk_key_args})"
         )
-        code.writeline("_compiled_cache = {}")
-        code.writeline("_disk_fn_cache = {}")
+        code.writeline("from torch._inductor.runtime.cutedsl_cache import BoundedCache")
+        code.writeline("_compiled_cache = BoundedCache()")
+        code.writeline("_disk_fn_cache = BoundedCache()")
         code.writeline(f"_VARIANT_KWARGS = {variant_kwargs_expr}")
         code.writeline(f"_ACC_TYPE = {acc_dtype_str}")
         input_param_names_repr = repr(input_tensor_names)
@@ -1756,6 +1958,7 @@ class NVUniversalGemmKernel(Kernel):
                 code.writeline(f"prefetch_mode={prefetch_mode!r},")
                 code.writeline(f"use_pdl={use_pdl!r},")
                 code.writeline(f"kernel_output_dtype={kernel_output_dtype_name!r},")
+                code.writeline(f"symbolic_shapes={symbolic_shapes},")
             code.writeline(")")
 
         # -- Precompile hook --
@@ -1791,6 +1994,7 @@ class NVUniversalGemmKernel(Kernel):
                 code.writeline(f"prefetch_mode={prefetch_mode!r},")
                 code.writeline(f"use_pdl={use_pdl!r},")
                 code.writeline(f"kernel_output_dtype={kernel_output_dtype_name!r},")
+                code.writeline(f"symbolic_shapes={symbolic_shapes},")
             code.writeline(")")
 
         return code.getvalue()

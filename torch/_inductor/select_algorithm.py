@@ -5014,6 +5014,7 @@ class AlgorithmSelectorCache(PersistentCache):
                             has_output_scale=c.bmreq.has_output_scale,
                             swap_ab=c.bmreq.swap_ab,
                             metadata=c.bmreq.kernel.metadata,
+                            symbolic_shapes=c.bmreq.symbolic_shapes,
                         )
                     except (BrokenProcessPool, RuntimeError) as e:
                         # A precompile worker crashed and closed the pool. Stop
