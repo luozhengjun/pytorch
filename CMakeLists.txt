@@ -264,6 +264,7 @@ option(BUILD_TEST "Build C++ test binaries (need gtest and gbenchmark)" ON)
 option(BUILD_AOT_INDUCTOR_TEST "Build C++ test binaries for aot-inductor" OFF)
 option(BUILD_STATIC_RUNTIME_BENCHMARK
        "Build C++ binaries for static runtime benchmarks (need gbenchmark)" OFF)
+option(BUILD_MOBILE "Build C++ libraries for mobile (ARM) targets" OFF)
 option(
   BUILD_MOBILE_BENCHMARK
   "Build C++ test binaries for mobile (ARM) targets(need gtest and gbenchmark)"
@@ -745,9 +746,8 @@ endif()
 # applicable to mobile are disabled by this variable. Setting
 # `BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN` environment variable can force it
 # to do mobile build with host toolchain - which is useful for testing purpose.
-if(ANDROID
-   OR IOS
-   OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN})
+if(BUILD_MOBILE
+   AND (ANDROID OR IOS OR DEFINED ENV{BUILD_PYTORCH_MOBILE_WITH_HOST_TOOLCHAIN}))
   set(INTERN_BUILD_MOBILE ON)
   message(WARNING "INTERN_BUILD_MOBILE is on, disabling BUILD_LAZY_TS_BACKEND")
   set(BUILD_LAZY_TS_BACKEND OFF)

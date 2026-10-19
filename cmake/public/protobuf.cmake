@@ -6,7 +6,7 @@ if(NOT Protobuf_FOUND)
   find_package(Protobuf MODULE QUIET)
 endif()
 
-if((TARGET protobuf::libprotobuf OR TARGET protobuf::libprotobuf-lite) AND TARGET protobuf::protoc)
+if(TARGET protobuf::libprotobuf OR TARGET protobuf::libprotobuf-lite)
   # Hooray. This is the most ideal situation, meaning that you either have a
   # Protobuf config file installed (like on Windows), or you are using a
   # modern CMake that ships with a FindProtobuf.cmake file that produces

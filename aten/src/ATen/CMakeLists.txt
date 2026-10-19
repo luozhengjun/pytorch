@@ -781,7 +781,7 @@ if(USE_MKLDNN_ACL)
     list(APPEND ATen_CPU_DEPENDENCY_LIBS ${ACL_LIBRARIES})
 endif()
 
-if(NOT EMSCRIPTEN AND NOT INTERN_BUILD_MOBILE)
+if(NOT EMSCRIPTEN AND NOT ANDROID)
   if(NOT MSVC)
     # Bump up optimization level for sleef to -O1, since at -O0 the compiler
     # excessively spills intermediate vector registers to the stack

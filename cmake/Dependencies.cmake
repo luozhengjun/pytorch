@@ -1407,7 +1407,7 @@ if(CAFFE2_CMAKE_BUILDING_WITH_MAIN_REPO AND NOT INTERN_DISABLE_ONNX)
     # In mobile build we care about code size, and so we need drop
     # everything (e.g. checker) in onnx but the pb definition.
     if(ANDROID OR IOS)
-      caffe2_interface_library(onnx_proto onnx_library)
+      caffe2_interface_library(onnx onnx_library)
     else()
       caffe2_interface_library(onnx onnx_library)
     endif()
