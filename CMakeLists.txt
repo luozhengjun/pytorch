@@ -453,7 +453,7 @@ option(USE_MIMALLOC "Use mimalloc" OFF)
 # Enable third party mimalloc library to improve memory allocation performance
 # on Windows and AArch64.
 option(USE_MIMALLOC_ON_MKL "Use mimalloc on MKL" OFF)
-if(WIN32 OR (CPU_AARCH64 AND NOT APPLE))
+if(WIN32 OR (CPU_AARCH64 AND NOT APPLE AND NOT ANDROID))
   set(USE_MIMALLOC ON)
   # Disable OPT flags for mimalloc on aarch64 as it breaks ARMv8.0
   # See https://github.com/pytorch/pytorch/issues/174344
